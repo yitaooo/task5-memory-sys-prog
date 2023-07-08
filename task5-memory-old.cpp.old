@@ -1,0 +1,495 @@
+#include <assert.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <malloc.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include "help.h"
+class BlockList;
+struct SuperBlock;
+struct alignas(16) Block {
+    size_t size;
+    bool is_free;
+    SuperBlock *sb;
+    BlockList *parent;
+    Block *prev;
+    Block *next;
+
+    static Block *create(size_t size, BlockList *parent, Block *prev,
+                         Block *next) {
+        Block *block = (Block *)mmap(NULL, PAD_UP(sizeof(Block) + size, 16),
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+        if (block == MAP_FAILED) {
+            return nullptr;
+        }
+        block->size = size;
+        block->is_free = true;
+        block->parent = parent;
+        block->prev = prev;
+        block->next = next;
+        return block;
+    }
+
+    // Block() = delete;
+    static Block *allocate(size_t size) {
+        Block *block = (Block *)mmap(NULL, PAD_UP(sizeof(Block) + size, 16),
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+        if (block == MAP_FAILED) {
+            return nullptr;
+        }
+        block->size = size;
+        block->is_free = true;
+        block->sb = nullptr;
+        block->parent = nullptr;
+        block->prev = nullptr;
+        block->next = nullptr;
+        return block;
+    }
+    bool deallocate() { return !munmap(this, sizeof(Block) + size); }
+    size_t total_size() { return sizeof(Block) + size; }
+    void *data() { return (void *)((char *)this + sizeof(Block)); }
+
+    void slice(size_t size, Block *&right) {
+        size_t remain_size = this->size - size;
+        right = nullptr;
+        if (remain_size > sizeof(Block) + 16) {
+            right = (Block *)((uintptr_t)(this->data()) + size);
+            right->size = remain_size;
+            right->is_free = true;
+            right->sb = this->sb;
+            right->parent = this->parent;
+            right->prev = this;
+            right->next = this->next;
+            if (this->next) {
+                this->next->prev = right;
+            }
+            this->next = right;
+            this->size = size;
+        }
+    }
+};
+
+struct alignas(16) SuperBlock {
+    static constexpr size_t standard_size = 16 * 1024 * 1024;
+    static constexpr size_t max_child_count = 64;  // prevent fragmentation
+    SuperBlock *sb;
+    BlockList *parent;
+    SuperBlock *prev;
+    SuperBlock *next;
+
+    Block *first_child;
+    int size;
+    int used_size;
+    int child_count;
+    cspinlock slock;
+
+    static SuperBlock *allocate(size_t size, BlockList *parent,
+                                SuperBlock *prev, SuperBlock *next) {
+        SuperBlock *block = (SuperBlock *)mmap(
+            NULL, PAD_UP(sizeof(SuperBlock) + size, 16), PROT_READ | PROT_WRITE,
+            MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+        if (block == MAP_FAILED) {
+            return nullptr;
+        }
+        block->size = size;
+        block->parent = parent;
+        block->prev = prev;
+        block->next = next;
+        block->first_child = (Block *)block->data();
+        block->first_child->size = size - sizeof(Block);
+        block->first_child->is_free = true;
+        block->first_child->sb = block;
+        block->first_child->parent = parent;
+        block->first_child->prev = nullptr;
+        block->first_child->next = nullptr;
+        block->child_count = 1;
+        return block;
+    }
+
+    SuperBlock() = delete;
+    void lock() { slock.lock(); }
+    void unlock() { slock.unlock(); }
+    void *data() { return (void *)((char *)this + sizeof(SuperBlock)); }
+    bool deallocate() { return !munmap(this, sizeof(SuperBlock) + size); }
+
+    Block *malloc(size_t size) {
+        // fail
+        if (size > this->size - this->used_size ||
+            this->child_count >= max_child_count) {
+            return nullptr;
+        }
+        Block *b = this->first_child;
+        while (b) {
+            // find first free block
+            if (b->is_free && b->size >= size) {
+                Block *right;
+                b->slice(size, right);
+                b->is_free = false;
+                this->used_size += b->total_size();
+                if (right) {
+                    this->child_count++;
+                }
+                return b;
+            }
+            b = b->next;
+        }
+        return nullptr;
+    }
+
+    void free(Block *block) {
+        block->is_free = true;
+        this->used_size -= block->total_size();
+        Block *new_block;
+        // if next is free, merge with block
+        if (block->next && block->next->is_free) {
+            block->size += block->next->total_size();
+            block->next = block->next->next;
+            if (block->next) {
+                block->next->prev = block;
+            }
+            this->child_count--;
+        }
+        // if prev is free, merge with prev
+        if (block->prev && block->prev->is_free) {
+            block->prev->next = block->next;
+            block->prev->size += block->total_size();
+            new_block = block->prev;
+            if (block->next) {
+                block->next->prev = block->prev;
+            }
+            this->child_count--;
+        }
+    }
+
+    float used_ratio() { return (float)used_size / size; }
+};
+
+class BlockList {
+    cspinlock slock;
+    LinkList<Block> blocks;
+
+    Block *create_block(size_t size) {
+        Block *block = Block::create(size, this, nullptr, nullptr);
+        return block;
+    }
+
+    // try to merge physically adjacent free blocks into one larger block that
+    // meets needed_size
+    // if returns true, `this` and all involved blocks are mutated.
+    bool try_merge_adjacent_blocks(Block *block, size_t needed_size) {
+        if (block->is_free == false) {
+            return false;
+        }
+        if (block->size >= needed_size) {
+            return true;
+        }
+        // find the adjacent memory of current block
+        Block *adjacent_addr =
+            (Block *)(PAD_UP((uintptr_t)block->data() + block->size, 16));
+        Block *adjacent_block = blocks.find(adjacent_addr);
+        if (adjacent_block == nullptr) {
+            // the adjacent memory is not a block managed by us :(
+            return false;
+        }
+        // if the adjacent memory is another block, check if it is free
+        if (adjacent_block->is_free) {
+            // recursively check if the adjacent of adjacent block.
+            // if the adjacent block is merged into current block, the header
+            // part of it is also useable
+            size_t adjacent_block_needed_size =
+                needed_size - block->size - sizeof(Block);
+            bool adjacent_block_ok = try_merge_adjacent_blocks(
+                adjacent_block, adjacent_block_needed_size);
+            if (adjacent_block_ok) {
+                // merge the adjacent block to current block
+                block->size += adjacent_block->total_size();
+                // remove the adjacent block from the list
+                blocks.remove(adjacent_block);
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+   public:
+    // provide for std::lock_guard
+    void lock() { slock.lock(); }
+    void unlock() { slock.unlock(); }
+
+    // all these functions are NOT thread-safe, they should be called under lock
+    Block *find_available_block(size_t size);
+
+    Block *malloc(size_t size);
+
+    void free(Block *block) {
+        block->is_free = true;
+
+        Block *adjacent_block =
+            (Block *)(PAD_UP((uintptr_t)block->data() + block->size, 16));
+        if (adjacent_block->parent == this) {
+            if (adjacent_block->is_free) {
+                // merge the adjacent block to current block
+                block->size += adjacent_block->total_size();
+                // remove the adjacent block from the list
+                blocks.remove(adjacent_block);
+            }
+        }
+        if (block->size > 1024 * 1024) {
+            // if the block is too large, deallocate it
+            blocks.remove(block);
+            block->deallocate();
+        }
+    }
+
+    void print() {
+        int block_count = 0;
+        int free_block_count = 0;
+        int used_block_count = 0;
+        int total_free_size = 0;
+        int total_used_size = 0;
+        Block *block = blocks.head;
+        while (block != nullptr) {
+            if (block->is_free) {
+                free_block_count++;
+                total_free_size += block->size;
+            } else {
+                used_block_count++;
+                total_used_size += block->size;
+            }
+            block_count++;
+            block = block->next;
+        }
+        printf("block_count: %d\n", block_count);
+        printf("free_block_count: %d\n", free_block_count);
+        printf("used_block_count: %d\n", used_block_count);
+        printf("total_free_size: %d\n", total_free_size);
+        printf("total_used_size: %d\n", total_used_size);
+    }
+};
+
+Block *BlockList::find_available_block(size_t size) {
+    // return nullptr;
+    Block *block = blocks.head;
+    while (block != nullptr) {
+        if (block->is_free && block->size == size) {
+            return block;
+        }
+        block = block->next;
+    }
+    // can't find a single block large enough
+    return nullptr;
+}
+Block *BlockList::malloc(size_t size) {
+    Block *block = find_available_block(size);
+    if (block == nullptr) {
+        block = create_block(size);
+        if (block == nullptr) {
+            return nullptr;
+        }
+        blocks.insert(block);
+    }
+    block->is_free = false;
+    return block;
+}
+#define MAX_LIST_NUM 16
+static BlockList block_lists[MAX_LIST_NUM];
+static unsigned thread_id = 0;
+
+extern "C" {
+void _print() {
+    printf("thread_id: %d\n", thread_id);
+    for (int i = 0; i < MAX_LIST_NUM; i++) {
+        printf("list %d:\n", i);
+        block_lists[i].print();
+    }
+}
+
+void *extend_heap_size(size_t size) {
+    // mmap itself is thread-safe
+    void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return ptr;
+}
+
+void *_malloc(size_t size) {
+    unsigned list_idx, numa;
+    getcpu(&list_idx, &numa);
+    list_idx = list_idx % MAX_LIST_NUM;
+    BlockList *list = &block_lists[list_idx];
+    list->lock();
+    Block *block = list->malloc(size);
+    list->unlock();
+    if (block == nullptr) {
+        return nullptr;
+    }
+    return block->data();
+}
+
+void _free(void *ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    Block *block = reinterpret_cast<Block *>(((uintptr_t)ptr - sizeof(Block)));
+    BlockList *list = block->parent;
+    list->lock();
+    list->free(block);
+    list->unlock();
+    return;
+}
+
+void *malloc(size_t size) { return _malloc(size); }
+void *calloc(size_t nmemb, size_t size) {
+    size_t total_size = nmemb * size;
+    void *ptr = malloc(total_size);
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+    memset(ptr, 0, total_size);
+    return ptr;
+}
+void *realloc(void *ptr, size_t size) {
+    if (ptr == nullptr) {
+        return malloc(size);
+    }
+    // Block *block = reinterpret_cast<Block *>(((uintptr_t)ptr -
+    // sizeof(Block))); if (block->size >= size) {
+    //     return ptr;
+    // }
+    void *new_ptr = malloc(size);
+    if (new_ptr == nullptr) {
+        return nullptr;
+    }
+    memcpy(new_ptr, ptr, size);
+    free(ptr);
+    return new_ptr;
+}
+void free(void *ptr) { _free(ptr); }
+
+#if 1
+#else
+static void *(*real_malloc)(size_t) = NULL;
+static void *(*real_realloc)(void *, size_t) = NULL;
+static void *(*real_calloc)(size_t, size_t) = NULL;
+static void (*real_free)(void *) = NULL;
+
+static int alloc_init_pending = 0;
+
+/* Load original allocation routines at first use */
+static void alloc_init(void) {
+    alloc_init_pending = 1;
+    real_malloc = (decltype(real_malloc))dlsym(RTLD_NEXT, "malloc");
+    real_realloc = (decltype(real_realloc))dlsym(RTLD_NEXT, "realloc");
+    real_calloc = (decltype(real_calloc))dlsym(RTLD_NEXT, "calloc");
+    real_free = (decltype(real_free))dlsym(RTLD_NEXT, "free");
+    if (!real_malloc || !real_realloc || !real_calloc || !real_free) {
+        fputs("alloc.so: Unable to hook allocation!\n", stderr);
+        fputs(dlerror(), stderr);
+        exit(1);
+    } else {
+        fputs("alloc.so: Successfully hooked\n", stderr);
+    }
+    alloc_init_pending = 0;
+}
+
+#define ZALLOC_MAX 1024
+static void *zalloc_list[ZALLOC_MAX];
+static size_t zalloc_cnt = 0;
+
+/* dlsym needs dynamic memory before we can resolve the real memory
+ * allocator routines. To support this, we offer simple mmap-based
+ * allocation during alloc_init_pending.
+ * We support a max. of ZALLOC_MAX allocations.
+ *
+ * On the tested Ubuntu 16.04 with glibc-2.23, this happens only once.
+ */
+void *zalloc_internal(size_t size) {
+    fputs("alloc.so: zalloc_internal called", stderr);
+    if (zalloc_cnt >= ZALLOC_MAX - 1) {
+        fputs("alloc.so: Out of internal memory\n", stderr);
+        return NULL;
+    }
+    /* Anonymous mapping ensures that pages are zero'd */
+    void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                     MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+    if (MAP_FAILED == ptr) {
+        perror("alloc.so: zalloc_internal mmap failed");
+        return NULL;
+    }
+    zalloc_list[zalloc_cnt++] = ptr; /* keep track for later calls to free */
+    return ptr;
+}
+
+void free(void *ptr) {
+    if (alloc_init_pending) {
+        fputs("alloc.so: free internal\n", stderr);
+        /* Ignore 'free' during initialization and ignore potential mem leaks
+         * On the tested system, this did not happen
+         */
+        return;
+    }
+    if (!real_malloc) {
+        alloc_init();
+    }
+    for (size_t i = 0; i < zalloc_cnt; i++) {
+        if (zalloc_list[i] == ptr) {
+            /* If dlsym cleans up its dynamic memory allocated with
+             * zalloc_internal, we intercept and ignore it, as well as the
+             * resulting mem leaks. On the tested system, this did not happen
+             */
+            return;
+        }
+    }
+    real_free(ptr);
+}
+
+void *malloc(size_t size) {
+    if (list_idx != -1) {
+        return _malloc(size);
+    }
+    if (alloc_init_pending) {
+        fputs("alloc.so: malloc internal\n", stderr);
+        return zalloc_internal(size);
+    }
+    if (!real_malloc) {
+        alloc_init();
+    }
+    void *result = real_malloc(size);
+    // fprintf(stderr, "alloc.so: malloc(0x%zx) = %p\n", size, result);
+    return result;
+}
+
+void *realloc(void *ptr, size_t size) {
+    if (alloc_init_pending) {
+        fputs("alloc.so: realloc internal\n", stderr);
+        if (ptr) {
+            fputs("alloc.so: realloc resizing not supported\n", stderr);
+            exit(1);
+        }
+        return zalloc_internal(size);
+    }
+    if (!real_malloc) {
+        alloc_init();
+    }
+    return real_realloc(ptr, size);
+}
+
+void *calloc(size_t nmemb, size_t size) {
+    if (alloc_init_pending) {
+        fputs("alloc.so: calloc internal\n", stderr);
+        /* Be aware of integer overflow in nmemb*size.
+         * Can only be triggered by dlsym */
+        return zalloc_internal(nmemb * size);
+    }
+    if (!real_malloc) {
+        alloc_init();
+    }
+    return real_calloc(nmemb, size);
+}
+#endif
+}  // extern "C"
